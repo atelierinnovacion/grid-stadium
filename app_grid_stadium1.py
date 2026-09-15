@@ -1,100 +1,131 @@
-import streamlit as st
-import numpy as np
-import cv2
 import json
-import pandas as pd
-from PIL import Image
+import cv2
+import numpy as np
+import streamlit as st
 
-st.set_page_config(page_title="Audiovisual Projection Mapper", layout="wide")
+st.set_page_config(layout="wide", page_title="Projection Mapping Seat Divider")
 
-st.title("Projection & Stadium Seat Mapping Generator")
-st.write("Upload a target visual image and define region coordinates to map specific image sectors to physical seats.")
+st.title("Audiovisual Projection Mapper: Grid Segmenter")
+st.write(
+    "Upload a source image and a binary grid mask. The preview will render the exact artwork mapped onto each seat shape."
+)
 
 col1, col2 = st.columns(2)
-
 with col1:
-    img_file = st.file_uploader("1. Upload Target Image", type=["jpg", "png", "jpeg"])
+    source_file = st.file_uploader(
+        "Upload Source Image (Visual Content)", type=["jpg", "png", "jpeg"]
+    )
 with col2:
-    grid_file = st.file_uploader("2. Upload Grid Coordinates (JSON)", type=["json"])
+    grid_file = st.file_uploader(
+        "Upload Grid Mask (White seats on Black background)",
+        type=["jpg", "png", "jpeg"],
+    )
 
-def generate_default_grid(width, height, rows=10, cols=10):
-    """Generates a simple fallback grid if no file is provided."""
-    grid = []
-    dx = width / cols
-    dy = height / rows
-    for r in range(rows):
-        for c in range(cols):
-            grid.append({
-                "id": f"Seat_{r+1}_{c+1}",
-                "poly": [
-                    [int(c * dx), int(r * dy)],
-                    [int((c + 1) * dx), int(r * dy)],
-                    [int((c + 1) * dx), int((r + 1) * dy)],
-                    [int(c * dx), int((r + 1) * dy)]
-                ]
-            })
-    return grid
+if source_file and grid_file:
+    # Read images into OpenCV format
+    src_bytes = np.asarray(bytearray(source_file.read()), dtype=np.uint8)
+    source_img = cv2.imdecode(src_bytes, cv2.IMREAD_COLOR)
 
-if img_file is not None:
-    # Load Image
-    image = Image.open(img_file).convert("RGB")
-    img_np = np.array(image)
-    h, w, _ = img_np.shape
+    grid_bytes = np.asarray(bytearray(grid_file.read()), dtype=np.uint8)
+    grid_img = cv2.imdecode(grid_bytes, cv2.IMREAD_GRAYSCALE)
 
-    # Parse or Generate Grid
-    if grid_file is not None:
-        grid_data = json.load(grid_file)
-    else:
-        st.info("No custom grid uploaded. Generating a sample 10x10 seating grid.")
-        grid_data = generate_default_grid(w, h)
+    # Match dimensions
+    h, w = grid_img.shape[:2]
+    if source_img.shape[:2] != (h, w):
+        source_img = cv2.resize(
+            source_img, (w, h), interpolation=cv2.INTER_CUBIC
+        )
 
-    mapped_results = []
-    output_img = img_np.copy()
+    # Threshold grid to create binary mask (255 = seat area, 0 = background)
+    _, binary_mask = cv2.threshold(grid_img, 127, 255, cv2.THRESH_BINARY)
 
-    # Process each region in the grid
-    for item in grid_data:
-        seat_id = item["id"]
-        pts = np.array(item["poly"], dtype=np.int32)
+    # Find individual seat contours
+    contours, _ = cv2.findContours(
+        binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
 
-        # Create mask for bounding polygon
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.fillPoly(mask, [pts], 255)
+    st.success(f"Detected {len(contours)} distinct seat shapes.")
 
-        # Extract mean RGB color within polygon boundary
-        mean_val = cv2.mean(img_np, mask=mask)
-        rgb_color = (int(mean_val[0]), int(mean_val[1]), int(mean_val[2]))
-        hex_color = f"#{rgb_color[0]:02x}{rgb_color[1]:02x}{rgb_color[2]:02x}"
+    # 1. APPLY FULL MASK: Retain artwork ONLY inside the white seat regions
+    mapped_canvas = cv2.bitwise_and(source_img, source_img, mask=binary_mask)
 
-        # Draw extracted color back into preview image for verification
-        cv2.fillPoly(output_img, [pts], rgb_color)
-        cv2.polylines(output_img, [pts], True, (255, 255, 255), 1)
+    # 2. Extract seat individual crops & build JSON map
+    seat_crops = {}
+    json_mapping = {
+        "grid_dimensions": {"width": w, "height": h},
+        "total_seats": len(contours),
+        "seats": [],
+    }
 
-        mapped_results.append({
-            "seat_id": seat_id,
-            "r": rgb_color[0],
-            "g": rgb_color[1],
-            "b": rgb_color[2],
-            "hex": hex_color
-        })
+    # Canvas for text/outline overlays if user toggles them
+    overlay_canvas = mapped_canvas.copy()
 
-    # Render results
-    res_col1, res_col2 = st.columns(2)
-    with res_col1:
-        st.subheader("Source Visual")
-        st.image(image, use_container_width=True)
-    with res_col2:
-        st.subheader("Mapped Projection Preview")
-        st.image(output_img, use_container_width=True)
+    for idx, cnt in enumerate(contours):
+        seat_id = f"Seat_{idx+1}"
+        x, y, bw, bh = [int(v) for v in cv2.boundingRect(cnt)]
+        center_x = int(x + bw / 2)
+        center_y = int(y + bh / 2)
 
-    # Data export options
-    st.subheader("Mapped Output Data")
-    df = pd.DataFrame(mapped_results)
-    st.dataframe(df.head(10))
+        # Draw green seat outlines and ID numbers on the overlay version
+        cv2.drawContours(overlay_canvas, [cnt], -1, (0, 255, 0), 1)
+        cv2.putText(
+            overlay_canvas,
+            str(idx + 1),
+            (center_x - 5, center_y + 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.35,
+            (255, 255, 255),
+            1,
+        )
 
-    json_str = json.dumps(mapped_results, indent=2)
+        # Create individual crop for seat listing
+        single_seat_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(single_seat_mask, [cnt], -1, 255, -1)
+        isolated_source = cv2.bitwise_and(
+            source_img, source_img, mask=single_seat_mask
+        )
+        cropped_seat = isolated_source[y : y + bh, x : x + bw]
+
+        seat_crops[seat_id] = cv2.cvtColor(cropped_seat, cv2.COLOR_BGR2RGB)
+
+        json_mapping["seats"].append(
+            {
+                "id": seat_id,
+                "index": idx + 1,
+                "center": {"x": center_x, "y": center_y},
+                "bounding_box": {"x": x, "y": y, "width": bw, "height": bh},
+            }
+        )
+
+    # UI Options for Rendering Preview
+    st.subheader("Mapped Projection Output")
+
+    show_labels = st.checkbox("Show Seat IDs and Outlines", value=True)
+
+    # Convert to RGB for display
+    display_img = cv2.cvtColor(
+        overlay_canvas if show_labels else mapped_canvas, cv2.COLOR_BGR2RGB
+    )
+    st.image(
+        display_img,
+        caption="Full Stadium Render (Image segments applied only onto seat geometry)",
+        use_container_width=True,
+    )
+
+    # Export Section
+    st.subheader("JSON Coordinates Output")
+    json_str = json.dumps(json_mapping, indent=4)
+
     st.download_button(
-        label="Download Mapping Configuration (JSON)",
+        label="📄 Download JSON Seat Coordinates",
         data=json_str,
         file_name="seat_mapping.json",
-        mime="application/json"
+        mime="application/json",
     )
+
+    # Individual seat extracts
+    st.subheader("Extracted Seat Segments")
+    cols = st.columns(6)
+    for idx, (seat_name, img_rgb) in enumerate(seat_crops.items()):
+        col = cols[idx % 6]
+        col.image(img_rgb, caption=seat_name, width=100)
