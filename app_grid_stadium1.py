@@ -3,11 +3,11 @@ import cv2
 import numpy as np
 import streamlit as st
 
-st.set_page_config(layout="wide", page_title="Text Projection Mapper")
+st.set_page_config(layout="wide", page_title="Character-to-Seat Projection Mapper")
 
-st.title("Audiovisual Projection Mapper: Text-to-Seat Mapper")
+st.title("Audiovisual Projection Mapper: Character-to-Seat Mapper")
 st.write(
-    "Upload your text and grid mask. Adjust the seat separation controls if seats are detection as one big shape."
+    "Upload text and a stadium grid mask. Each letter, number, symbol, and space will be assigned to a distinct seat shape."
 )
 
 col1, col2 = st.columns(2)
@@ -19,7 +19,7 @@ with col1:
     if text_input_mode == "Type / Paste Text":
         raw_text = st.text_area(
             "Enter text content:",
-            "WELCOME TO THE GRAND STADIUM LIGHT SHOW ENJOY THE EXPERIENCE",
+            "WELCOME TO THE GRAND STADIUM LIGHT SHOW!",
             height=150,
         )
     else:
@@ -33,7 +33,6 @@ with col2:
         type=["jpg", "png", "jpeg"],
     )
 
-    # Calibration controls to fix single-contour / merged-seat problems
     st.markdown("**Grid Processing Calibration**")
     invert_grid = st.checkbox(
         "Invert Colors (Check if seats are BLACK on WHITE background)",
@@ -50,27 +49,25 @@ with col2:
         min_value=0,
         max_value=15,
         value=2,
-        help="Increase this value if all seats are merging into 1 shape.",
+        help="Increase if seats merge into a single shape.",
     )
 
 if raw_text and grid_file:
-    # 1. Clean words list
-    words = [w.strip() for w in raw_text.split() if w.strip()]
-    num_words = len(words)
+    # 1. Parse text into individual characters (including spaces)
+    characters = list(raw_text)
+    num_chars = len(characters)
 
     # 2. Load grid mask
     grid_bytes = np.asarray(bytearray(grid_file.read()), dtype=np.uint8)
     grid_img = cv2.imdecode(grid_bytes, cv2.IMREAD_GRAYSCALE)
     grid_h, grid_w = grid_img.shape[:2]
 
-    # Invert colors if user selected black-on-white seats
     if invert_grid:
         grid_img = cv2.bitwise_not(grid_img)
 
-    # Binary threshold
     _, binary_mask = cv2.threshold(grid_img, 127, 255, cv2.THRESH_BINARY)
 
-    # Apply Morphological Erode to cut connecting lines between seats
+    # Separate connected seats
     if separation_strength > 0:
         kernel = cv2.getStructuringElement(
             cv2.MORPH_RECT,
@@ -78,12 +75,11 @@ if raw_text and grid_file:
         )
         binary_mask = cv2.erode(binary_mask, kernel, iterations=1)
 
-    # Find raw contours
     raw_contours, _ = cv2.findContours(
         binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
 
-    # Filter out contours that are too small (noise) or too large (entire image frame)
+    # Filter invalid contours
     canvas_area = grid_h * grid_w
     valid_contours = []
     for cnt in raw_contours:
@@ -95,15 +91,15 @@ if raw_text and grid_file:
 
     if num_seats == 0:
         st.error(
-            "⚠️ 0 seats detected! Enable 'Invert Colors' or decrease 'Min Seat Size'."
+            "⚠️ 0 seats detected! Enable 'Invert Colors' or lower 'Min Seat Size'."
         )
     elif num_seats == 1:
         st.warning(
-            "⚠️ Only 1 seat detected! Increase the 'Seat Separation Force (Erosion)' slider to force connected seat shapes apart."
+            "⚠️ Only 1 seat detected! Increase 'Seat Separation Force (Erosion)'."
         )
 
     st.success(
-        f"Detected **{num_seats}** individual seats for **{num_words}** words."
+        f"Detected **{num_seats}** seats for **{num_chars}** characters (letters, numbers, and spaces)."
     )
 
     # Sort seats spatially (Top-to-Bottom, Left-to-Right)
@@ -116,7 +112,7 @@ if raw_text and grid_file:
     json_mapping = {
         "grid_dimensions": {"width": grid_w, "height": grid_h},
         "total_seats_detected": num_seats,
-        "total_words_mapped": min(num_words, num_seats),
+        "total_characters_mapped": min(num_chars, num_seats),
         "seats": [],
     }
 
@@ -125,26 +121,26 @@ if raw_text and grid_file:
         center_x = int(x + bw / 2)
         center_y = int(y + bh / 2)
 
-        assigned_word = words[idx] if idx < num_words else ""
+        assigned_char = characters[idx] if idx < num_chars else ""
 
-        # Fill seat background in white
+        # Draw white background for active seats
         cv2.drawContours(output_canvas, [cnt], -1, (255, 255, 255), -1)
 
-        # Draw word inside seat contour
-        if assigned_word:
+        # Draw character inside the seat (if not a space or empty)
+        if assigned_char and assigned_char != " ":
             font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.5
+            font_scale = 0.6
             thickness = 1
 
-            (text_w, text_h), baseline = cv2.getTextSize(
-                assigned_word, font, font_scale, thickness
+            (text_w, text_h), _ = cv2.getTextSize(
+                assigned_char, font, font_scale, thickness
             )
 
-            # Auto-scale font down if text is wider than the seat box
+            # Scale font to fit bounding box
             if text_w > (bw - 2) and bw > 4:
                 font_scale = max(0.12, font_scale * ((bw - 2) / text_w))
-                (text_w, text_h), baseline = cv2.getTextSize(
-                    assigned_word, font, font_scale, thickness
+                (text_w, text_h), _ = cv2.getTextSize(
+                    assigned_char, font, font_scale, thickness
                 )
 
             text_x = max(x, center_x - int(text_w / 2))
@@ -152,7 +148,7 @@ if raw_text and grid_file:
 
             cv2.putText(
                 output_canvas,
-                assigned_word,
+                assigned_char,
                 (text_x, text_y),
                 font,
                 font_scale,
@@ -167,7 +163,8 @@ if raw_text and grid_file:
                 "index": idx + 1,
                 "center": {"x": center_x, "y": center_y},
                 "bounding_box": {"x": x, "y": y, "width": bw, "height": bh},
-                "assigned_word": assigned_word,
+                "assigned_character": assigned_char,
+                "is_space": assigned_char == " ",
             }
         )
 
@@ -183,14 +180,16 @@ if raw_text and grid_file:
         overlay_canvas if show_boxes else output_canvas, cv2.COLOR_BGR2RGB
     )
     st.image(
-        display_img, caption="Text-to-Seat Render", use_container_width=True
+        display_img,
+        caption="Character-to-Seat Render",
+        use_container_width=True,
     )
 
-    st.subheader("JSON Mapping Output")
+    st.subheader("JSON Character Mapping Output")
     json_str = json.dumps(json_mapping, indent=4)
     st.download_button(
         label="📄 Download JSON Coordinates",
         data=json_str,
-        file_name="seat_text_mapping.json",
+        file_name="seat_char_mapping.json",
         mime="application/json",
     )
